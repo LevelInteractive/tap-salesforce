@@ -14,7 +14,7 @@ LOGGER = singer.get_logger()
 
 
 class Bulk2:
-    bulk_url = "{}/services/data/v60.0/jobs/query"
+    bulk_url = "{}/services/data/v67.0/jobs/query"
 
     def __init__(self, sf):
         csv.field_size_limit(sys.maxsize)
