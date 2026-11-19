@@ -16,9 +16,13 @@ PasswordCredentials = namedtuple("PasswordCredentials", ("username", "password",
 
 JWTCredentials = namedtuple("JWTCredentials", ("jwt_client_id", "jwt_username", "jwt_private_key"))
 
+# OAuth 2.0 Client Credentials. Shares client_id/client_secret with OAuthCredentials;
+# a config that also has refresh_token resolves to OAuthCredentials first.
+ClientCredentials = namedtuple("ClientCredentials", ("client_id", "client_secret", "my_domain_url"))
+
 
 def parse_credentials(config):
-    for cls in (JWTCredentials, OAuthCredentials, PasswordCredentials):
+    for cls in (JWTCredentials, OAuthCredentials, ClientCredentials, PasswordCredentials):
         creds = cls(*(config.get(key) for key in cls._fields))
         if all(creds):
             _validate_api_type(creds, config.get("api_type"))
@@ -34,11 +38,12 @@ def _validate_api_type(creds, api_type):
     # errors on every stream at job-create time. Bulk 2.0 uses Bearer tokens and
     # works fine. Fail fast with a clear message rather than letting the run die
     # later mid-sync.
-    if isinstance(creds, JWTCredentials) and (api_type or "").upper() == "BULK":
+    # The same applies to Client Credentials, which also never goes through SOAP login().
+    if isinstance(creds, (JWTCredentials, ClientCredentials)) and (api_type or "").upper() == "BULK":
         raise Exception(
             "Configuration conflict: api_type='BULK' (Bulk API 1.0) is not "
-            "compatible with OAuth2 JWT Bearer authentication. Bulk 1.0 requires "
-            "a SOAP session id, which JWT bearer does not issue. "
+            "compatible with OAuth2 JWT Bearer or Client Credentials authentication. "
+            "Bulk 1.0 requires a SOAP session id, which these flows do not issue. "
             "Use api_type='BULK2' (recommended) or 'REST' instead, or switch "
             "to password-based authentication if you must use Bulk 1.0."
         )
@@ -81,6 +86,9 @@ class SalesforceAuth:
 
         if isinstance(credentials, JWTCredentials):
             return SalesforceAuthJWT(credentials, **kwargs)
+
+        if isinstance(credentials, ClientCredentials):
+            return SalesforceAuthClientCredentials(credentials, **kwargs)
 
         raise Exception("Invalid credentials")
 
@@ -181,6 +189,56 @@ class SalesforceAuthJWT(SalesforceAuth):
             auth = resp.json()
 
             LOGGER.info("OAuth2 JWT Bearer login successful")
+            self._access_token = auth["access_token"]
+            self._instance_url = auth["instance_url"]
+        except Exception as e:
+            error_message = str(e)
+            if resp is not None:
+                error_message = error_message + f", Response from Salesforce: {resp.text}"
+            raise Exception(error_message) from e
+        finally:
+            LOGGER.info("Starting new login timer")
+            self.login_timer = threading.Timer(self.LOGIN_REFRESH_PERIOD, self.login)
+            self.login_timer.daemon = True
+            self.login_timer.start()
+
+
+class SalesforceAuthClientCredentials(SalesforceAuth):
+    """OAuth 2.0 Client Credentials flow (server-to-server, runs as the app's "Run As" user).
+
+    Salesforce only serves this grant from the org's My Domain URL, not from
+    login.salesforce.com / test.salesforce.com, so the domain comes from config and
+    is_sandbox does not apply. No refresh token is issued; re-login periodically instead.
+    """
+
+    LOGIN_REFRESH_PERIOD = 1800
+
+    @property
+    def _login_url(self):
+        domain = self._credentials.my_domain_url.strip().rstrip("/")
+        if not domain.startswith("https://"):
+            domain = "https://" + domain.removeprefix("http://")
+        return f"{domain}/services/oauth2/token"
+
+    def login(self):
+        resp = None
+        try:
+            LOGGER.info("Attempting login via OAuth2 Client Credentials")
+
+            resp = requests.post(
+                self._login_url,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self._credentials.client_id,
+                    "client_secret": self._credentials.client_secret,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+
+            resp.raise_for_status()
+            auth = resp.json()
+
+            LOGGER.info("OAuth2 Client Credentials login successful")
             self._access_token = auth["access_token"]
             self._instance_url = auth["instance_url"]
         except Exception as e:
